@@ -121,7 +121,7 @@ class MemoryTrainingModule(pl.LightningModule):
             trust_remote_code=args.trust_remote_code,
             load_in_4bit=getattr(args, "load_in_4bit", False),
         )
-        self.memory.to(dtype=dtype).train()
+        self.memory.to(dtype=torch.float32 if dtype == torch.float16 else dtype).train()
         self.llm.text_model.requires_grad_(False).eval()
 
     def _warm_start(self, path: Path) -> None:
@@ -299,6 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
     optimisation.add_argument("--batch_size", type=int, default=2, help="Examples per GPU and batch.")
     optimisation.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Batches per optimiser step.")
     optimisation.add_argument("--max_epochs", type=int, default=5, help="Training epochs.")
+    optimisation.add_argument("--max_steps", type=int, default=-1, help="Max optimiser steps (-1 for full epochs).")
     optimisation.add_argument(
         "--val_check_interval", type=float, default=1.0, help="Fraction of an epoch between validations."
     )
@@ -424,6 +425,7 @@ def main(args: argparse.Namespace) -> None:
         strategy=args.strategy,
         precision="16-mixed" if args.dtype == "float16" else "bf16-mixed",
         max_epochs=args.max_epochs,
+        max_steps=args.max_steps,
         accumulate_grad_batches=args.gradient_accumulation_steps,
         gradient_clip_val=GRADIENT_CLIP_VAL,
         val_check_interval=args.val_check_interval if validation_set is not None else None,
