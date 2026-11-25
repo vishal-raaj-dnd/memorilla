@@ -40,6 +40,7 @@ from memorilla.memory import (
     DEFAULT_NUM_MEMORIES,
     DEFAULT_NUM_SELF_ATTN_LAYERS,
     MemoryModule,
+    slot_orthogonality_loss,
 )
 from memorilla.paths import DATA_DIR, DATA_REPO, DEFAULT_DECODER, DEFAULT_ENCODER, MODEL_CACHE_DIR, resolve
 from memorilla.utils import DEFAULT_SEED, MEMORY_PREFIX, load_memory_state, read_recipe, str2bool
@@ -110,14 +111,17 @@ class MemoryTrainingModule(pl.LightningModule):
         if args.init_memory:
             self._warm_start(resolve(args.init_memory))
 
+        dtype = getattr(torch, getattr(args, "dtype", "bfloat16"))
         self.llm = MemoryLLM(
             args.decoder,
             self.memory,
             attn_implementation=args.attn_implementation,
             cache_dir=args.cache_dir,
+            dtype=dtype,
             trust_remote_code=args.trust_remote_code,
+            load_in_4bit=getattr(args, "load_in_4bit", False),
         )
-        self.memory.to(dtype=torch.bfloat16).train()
+        self.memory.to(dtype=dtype).train()
         self.llm.text_model.requires_grad_(False).eval()
 
     def _warm_start(self, path: Path) -> None:
@@ -134,33 +138,26 @@ class MemoryTrainingModule(pl.LightningModule):
         if unexpected:
             rank_zero_warn(f"Ignored (not part of this architecture): {unexpected}")
 
-    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """One optimisation step; the logged training loss is this process's (no cross-GPU synchronisation per step).
-
-        Args:
-            batch: Output of ``MemoryCollator``.
-            batch_idx: Batch index.
-
-        Returns:
-            The answer-token loss.
-        """
-        loss = self.llm(**batch).loss
-        self.log("train_loss", loss.detach(), on_step=True, on_epoch=True, prog_bar=True)
+    def _shared_step(self, batch: dict[str, torch.Tensor], prefix: str, sync_dist: bool = False) -> torch.Tensor:
+        """Compute LM loss plus optional slot-orthogonality penalty and log components."""
+        output, memory_tokens = self.llm(**batch, return_memory_tokens=True)
+        lm_loss = output.loss
+        ortho_loss = slot_orthogonality_loss(memory_tokens, margin=getattr(self.hparams, "slot_ortho_margin", 0.0))
+        weight = getattr(self.hparams, "slot_ortho_weight", 0.0)
+        loss = lm_loss + weight * ortho_loss if weight > 0 else lm_loss
+        on_step = prefix == "train"
+        self.log(f"{prefix}_loss", loss.detach(), on_step=on_step, on_epoch=True, prog_bar=True, sync_dist=sync_dist)
+        self.log(f"{prefix}_lm_loss", lm_loss.detach(), on_step=on_step, on_epoch=True, sync_dist=sync_dist)
+        self.log(f"{prefix}_ortho_loss", ortho_loss.detach(), on_step=on_step, on_epoch=True, sync_dist=sync_dist)
         return loss
+
+    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        """One optimisation step; the logged training loss is this process's (no cross-GPU synchronisation per step)."""
+        return self._shared_step(batch, "train", sync_dist=False)
 
     def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """One validation step; the validation loss is averaged over all processes at the end of validation.
-
-        Args:
-            batch: Output of ``MemoryCollator``.
-            batch_idx: Batch index.
-
-        Returns:
-            The answer-token loss.
-        """
-        loss = self.llm(**batch).loss
-        self.log("val_loss", loss.detach(), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        return loss
+        """One validation step; the validation loss is averaged over all processes at the end of validation."""
+        return self._shared_step(batch, "val", sync_dist=True)
 
     def configure_optimizers(self) -> tuple[list[torch.optim.Optimizer], list[dict[str, Any]]]:
         """AdamW over the memory parameters with linear warmup followed by cosine decay to 10% of the peak rate.
@@ -279,6 +276,19 @@ def build_parser() -> argparse.ArgumentParser:
     model.add_argument(
         "--attn_implementation", type=str, default="flash_attention_2", help="Attention implementation of the decoder."
     )
+    model.add_argument(
+        "--dtype",
+        type=str,
+        choices=("bfloat16", "float16"),
+        default="bfloat16",
+        help="Model and mixed-precision compute dtype (use float16 on T4 GPUs).",
+    )
+    model.add_argument(
+        "--load_in_4bit",
+        type=str2bool,
+        default=False,
+        help="Load the frozen decoder in 4-bit NF4 for low-VRAM GPUs.",
+    )
 
     optimisation = parser.add_argument_group("optimisation")
     optimisation.add_argument("--learning_rate", type=float, default=1e-4, help="Peak learning rate.")
@@ -293,6 +303,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--val_check_interval", type=float, default=1.0, help="Fraction of an epoch between validations."
     )
     optimisation.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Random seed.")
+    optimisation.add_argument(
+        "--slot_ortho_weight",
+        type=float,
+        default=0.0,
+        help="Weight of the slot-orthogonality diversity penalty (0 disables it).",
+    )
+    optimisation.add_argument(
+        "--slot_ortho_margin",
+        type=float,
+        default=0.0,
+        help="Allowed cosine similarity margin before penalizing slot overlap.",
+    )
 
     infrastructure = parser.add_argument_group("infrastructure")
     infrastructure.add_argument("--devices", type=int, default=1, help="GPUs per node (-1 uses all).")
@@ -400,7 +422,7 @@ def main(args: argparse.Namespace) -> None:
         devices=args.devices,
         num_nodes=args.num_nodes,
         strategy=args.strategy,
-        precision="bf16-mixed",
+        precision="16-mixed" if args.dtype == "float16" else "bf16-mixed",
         max_epochs=args.max_epochs,
         accumulate_grad_batches=args.gradient_accumulation_steps,
         gradient_clip_val=GRADIENT_CLIP_VAL,

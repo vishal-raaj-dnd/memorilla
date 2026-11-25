@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import torch
 
-from memorilla.memory import DEFAULT_NUM_MEMORIES, MemoryConfig, MemoryModule
+from memorilla.memory import DEFAULT_NUM_MEMORIES, MemoryConfig, MemoryModule, slot_orthogonality_loss
 from memorilla.utils import CHECKPOINT_FILE, CONFIG_FILE, load_memory_state
 
 EMBEDDING_DIM = 32
@@ -242,3 +242,25 @@ def test_memory_cache_rejects_mismatched_batches() -> None:
     module = MemoryModule(embedding_dim=16, output_dim=12, num_memories=4, num_heads=2).eval()
     with pytest.raises(ValueError, match="collections"):
         module.read_cache(module.write_cache(torch.randn(2, 5, 16)), torch.randn(3, 16))
+
+
+def test_slot_orthogonality_loss() -> None:
+    """Orthogonal slots score 0, collapsed slots score 1, K=1 scores 0, and gradients flow."""
+    orthogonal = torch.eye(4).unsqueeze(0)
+    assert torch.isclose(slot_orthogonality_loss(orthogonal), torch.tensor(0.0))
+
+    collapsed = torch.ones(2, 4, 8)
+    assert torch.isclose(slot_orthogonality_loss(collapsed), torch.tensor(1.0))
+    assert torch.isclose(slot_orthogonality_loss(collapsed, margin=0.25), torch.tensor(0.75**2))
+
+    mild = torch.tensor([[[1.0, 0.0], [0.2, (1 - 0.04) ** 0.5]]])
+    assert torch.isclose(slot_orthogonality_loss(mild, margin=0.2), torch.tensor(0.0), atol=1e-6)
+
+    single = torch.randn(2, 1, 8)
+    assert torch.isclose(slot_orthogonality_loss(single), torch.tensor(0.0))
+
+    memory = make_memory().train()
+    docs, mask, question = random_inputs()
+    loss = slot_orthogonality_loss(memory(docs, mask, question))
+    loss.backward()
+    assert memory.memory_queries.grad is not None and memory.memory_queries.grad.abs().sum() > 0

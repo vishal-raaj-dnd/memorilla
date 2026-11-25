@@ -111,6 +111,26 @@ def _count_layers(state: dict[str, torch.Tensor], pattern: str) -> int:
     return len(indices)
 
 
+def slot_orthogonality_loss(memory_tokens: torch.Tensor, margin: float = 0.0) -> torch.Tensor:
+    """Mean squared excess off-diagonal cosine similarity across memory slots.
+
+    Args:
+        memory_tokens: Output memory tokens ``[batch, num_memories, output_dim]``.
+        margin: Allowed similarity threshold in ``[0, 1)`` before penalizing overlap.
+
+    Returns:
+        Scalar penalty in ``[0, 1]`` (0 when all off-diagonal pairs have ``|cos| <= margin``).
+    """
+    num_slots = memory_tokens.size(1)
+    if num_slots < 2:
+        return memory_tokens.new_zeros(())
+    normed = F.normalize(memory_tokens.float(), p=2, dim=-1)
+    sim = torch.bmm(normed, normed.transpose(1, 2))
+    eye = torch.eye(num_slots, device=sim.device, dtype=torch.bool).unsqueeze(0)
+    excess = (sim.masked_select(~eye).abs() - margin).clamp(min=0.0)
+    return excess.pow(2).mean()
+
+
 def _multihead_attention(embedding_dim: int, num_heads: int, dropout: float) -> nn.MultiheadAttention:
     """Build a batch-first multi-head attention layer.
 

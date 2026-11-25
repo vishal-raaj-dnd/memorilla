@@ -1,0 +1,13 @@
+# Ablation 1 (Slot-Orthogonality): continue Stage 3 on PersonaMem-v2 with diversity penalty.
+datasets: [pmv2]
+init_memory: runs/stage3/epoch-04
+output_dir: runs/ablation1_pmv2
+max_length: 2048
+learning_rate: 1.0e-4
+warmup_ratio: 0.1
+slot_ortho_weight: 0.05
+slot_ortho_margin: 0.0
+max_epochs: 5
+batch_size: 2
+gradient_accumulation_steps: 2
+devices: 4

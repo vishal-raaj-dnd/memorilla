@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from memorilla.memory import MemoryModule
@@ -53,6 +53,7 @@ class MemoryLLM(nn.Module):
         cache_dir: str | None = None,
         dtype: torch.dtype = torch.bfloat16,
         trust_remote_code: bool = False,
+        load_in_4bit: bool = False,
     ) -> None:
         """Load the decoder and tokenizer.
 
@@ -61,18 +62,25 @@ class MemoryLLM(nn.Module):
             memory: The memory module.
             attn_implementation: Decoder attention implementation, e.g. ``flash_attention_2`` or ``sdpa``.
             cache_dir: Model cache directory (None uses the Hugging Face default).
-            dtype: Decoder dtype.
+            dtype: Decoder and compute dtype.
             trust_remote_code: Allow custom model code from the decoder's repository to run.
+            load_in_4bit: Quantize the frozen decoder to 4-bit NF4 for low-VRAM GPUs (e.g. T4).
         """
         super().__init__()
         self.memory = memory
-        self.text_model = AutoModelForCausalLM.from_pretrained(
-            decoder,
-            cache_dir=cache_dir,
-            torch_dtype=dtype,
-            trust_remote_code=trust_remote_code,
-            attn_implementation=attn_implementation,
-        )
+        model_kwargs: dict[str, object] = {
+            "cache_dir": cache_dir,
+            "torch_dtype": dtype,
+            "trust_remote_code": trust_remote_code,
+            "attn_implementation": attn_implementation,
+        }
+        if load_in_4bit:
+            device_index = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            model_kwargs["device_map"] = {"": device_index}
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_compute_dtype=dtype, bnb_4bit_quant_type="nf4"
+            )
+        self.text_model = AutoModelForCausalLM.from_pretrained(decoder, **model_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(
             decoder, cache_dir=cache_dir, trust_remote_code=trust_remote_code
         )
@@ -87,7 +95,8 @@ class MemoryLLM(nn.Module):
         doc_padding_mask: torch.Tensor,
         question_embeds: torch.Tensor,
         labels: torch.Tensor | None = None,
-    ) -> CausalLMOutputWithPast:
+        return_memory_tokens: bool = False,
+    ) -> CausalLMOutputWithPast | tuple[CausalLMOutputWithPast, torch.Tensor]:
         """Run the memory module and the decoder.
 
         Args:
@@ -97,11 +106,16 @@ class MemoryLLM(nn.Module):
             doc_padding_mask: ``[batch, num_docs]`` with True at padding positions.
             question_embeds: Question embeddings ``[batch, embedding_dim]``.
             labels: Target ids with -100 at ignored positions, or None.
+            return_memory_tokens: If True, also return the generated memory tokens.
 
         Returns:
-            The decoder output; ``loss`` is set when ``labels`` is given.
+            The decoder output (or ``(output, memory_tokens)`` when ``return_memory_tokens`` is True).
         """
-        memory_tokens = self.memory(doc_embeds, doc_padding_mask, question_embeds)
+        mem_dtype = next(self.memory.parameters()).dtype
+        memory_tokens = self.memory(
+            doc_embeds.to(dtype=mem_dtype), doc_padding_mask, question_embeds.to(dtype=mem_dtype)
+        )
         inputs_embeds = self.text_model.get_input_embeddings()(input_ids)
         inputs_embeds = inject_memory(inputs_embeds, memory_tokens, input_ids, self.memory_token_id)
-        return self.text_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
+        output = self.text_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels)
+        return (output, memory_tokens) if return_memory_tokens else output
